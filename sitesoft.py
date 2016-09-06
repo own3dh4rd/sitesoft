@@ -2,12 +2,19 @@ import argparse
 import urllib.request
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
-import threading
-import queue
+from bs4 import SoupStrainer
 import time
+import concurrent.futures
+import redis
+import json
+import os.path
+import resource
+from sys import platform
 
 
-DEPTH = 0
+db = redis.StrictRedis()
+
+EXTENSIONS = ('.wav', '.mp3', '.bmp', '.gif', '.jpg', '.png', '.mp4')
 
 
 class Profiler:
@@ -15,112 +22,140 @@ class Profiler:
         self._startTime = time.time()
 
     def __exit__(self, type, value, traceback):
-        s = 'ok, execution time: {:.3f}sec, peak memory usage: 228Mb'
-        print(s.format(time.time() - self._startTime))
+        s = '>> ok, execution time: {}s, peak memory usage: {}Mb'
+        ex_time = int(time.time() - self._startTime)
+
+        if platform.startswith('linux'):
+            memory_usage = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+        elif platform.startswith('darwin'):
+            memory_usage = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 / 1024)
+        else:
+            memory_usage = '???'
+            #windows ;(
+        print(s.format(ex_time, memory_usage))
 
 
-class Worker(threading.Thread):
-    def __init__(self, tasks):
-        threading.Thread.__init__(self)
-        self.tasks = tasks
-        self.daemon = True
-        self.start()
+def save(db, url, data):
+    db.set(url, data)
 
-    def run(self):
-        while True:
-            if self.tasks.empty():
-                break
-            parser = self.tasks.get()
+
+def load(db, url):
+    return db.get(url)
+
+
+def getTitle(data):
+    title_tag = SoupStrainer('title')
+    parser_title = BeautifulSoup(data, 'lxml', parse_only=title_tag)
+    return parser_title.title.text if parser_title.title else 'None'
+
+
+def getURLS(data):
+    a_tags = SoupStrainer('a')
+    parser_a = BeautifulSoup(data, 'lxml', parse_only=a_tags)
+    urls = []
+    for x in parser_a.find_all('a'):
+        url = x.get('href')
+        if url and is_valid_url(url) and url not in urls:
+            urls.append(url)
+
+    return urls
+
+
+def getHTML(data):
+    html_tag = SoupStrainer('html')
+    parser_html = BeautifulSoup(data, 'lxml', parse_only=html_tag)
+    return parser_html.html.text if parser_html.html else 'None'
+
+
+def load_url(url, timeout=60):
+    with urllib.request.urlopen(url, timeout=timeout) as conn:
+        return conn.read().decode('utf-8')
+
+
+def run(root, links, num_workers=32, depth=0):
+    result = []
+    s = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_url = {
+            executor.submit(load_url, url, 60): url for url in links}
+        for future in concurrent.futures.as_completed(future_to_url):
+            url = future_to_url[future]
             try:
-                parser.parsePage()
-                if parser.depth:
-                    for l in parser.links:
-                        self.tasks.put(Parser(l, depth=parser.depth - 1))
+                data = future.result()
 
-            except Exception as e:
-                print(e)
-            finally:
-                self.tasks.task_done()
+                if not data:
+                    continue
 
+                title = getTitle(data)
+                html = getHTML(data)
 
-class Pool:
-    def __init__(self, num_threads):
-        self.tasks = queue.Queue()
-        self.num_threads = num_threads
+                # print('{}: "{}"'.format(url, title))
 
-    def add_task(self, task):
-        self.tasks.put(task)
+                s.append({'url': url, 'title': title, 'html': html})
 
-    def wait_completion(self):
-        self.tasks.join()
+                if depth == 2:
+                    t = getURLS(data)
+                    for x in t:
+                        result.append(x)
+            except Exception as exc:
+                # print('%r generated an exception: %s' % (url, exc))
+                pass
 
-    def run(self):
-        for _ in range(self.num_threads):
-            Worker(self.tasks)
+    _json = json.dumps(s, ensure_ascii=False).encode('utf-8')
+    save(db, root, _json)
 
-
-class Parser:
-    def __init__(self, url, depth=0):
-        self._url = url
-        self.links = []
-        self.depth = depth
-
-    def getData(self, url):
-        try:
-            with urllib.request.urlopen(url) as f:
-                data = f.read().decode('utf-8')
-        except Exception as e:
-            # print('Error - {} on the URL: {}'.format(e, url))
-            return None
-
-        return data
-
-    def getTitle(self, parser):
-        return parser.title.string if parser.title else 'None'
-
-    def parsePage(self):
-        data = self.getData(self._url)
-
-        if data is None:
-            return
-
-        parser = BeautifulSoup(data, 'html.parser')
-        for x in parser.find_all('a'):
-            link = x.get('href')
-            if link and is_valid_url(link) and link not in self.links:
-                self.links.append(link)
-        # self.links = [
-        #     x.get('href')
-        #     for x in parser.find_all('a')
-        #     if x.get('href') and is_valid_url(x.get('href')) and x.get('href') not in self.links]
-        print('{}: "{}"'.format(self._url, parser.title.string))
-        return (data, self._url, self.links, self.getTitle(parser))
+    return result
 
 
 def print_load(args):
     url = args.URL
-    global DEPTH
     DEPTH = args.depth
-    nums_threads = args.threads
+    num_workers = args.workers
 
-    if not nums_threads:
-        nums_threads = 16
-
-    pool = Pool(nums_threads)
+    if not num_workers:
+        num_workers = 32
 
     with Profiler() as p:
-        pool.add_task(Parser(url, depth=DEPTH))
-        pool.run()
-        pool.wait_completion()
+        if DEPTH == 0:
+            data = load_url(url)
+            title, html = getTitle(data), getHTML(data)
+
+            s = [{'url': url, 'title': title, 'html': html}]
+            _json = json.dumps(s, ensure_ascii=False).encode('utf-8')
+            save(db, url, _json)
+            return
+        elif DEPTH == 1 or DEPTH == 2:
+            data = load_url(url)
+            urls, title, html = getURLS(data), getTitle(data), getHTML(data)
+        # print('{}: "{}"'.format(url, title))
+
+        result = run(url, urls, num_workers, DEPTH)
+        if result:
+            run(url, result, num_workers)
 
 
 def print_get(args):
-    pass
+    url = args.URL
+    n = args.n
+
+    if not n:
+        raise Exception("n must be positive")
+        return
+
+    try:
+        data = json.loads(load(db, url).decode('utf-8'))[0:n]
+    except AttributeError:
+        print('Wrong URL')
+        return
+    for i, dct in enumerate(data, start=1):
+        print('>> {}. {}: "{}"'.format(i, dct['url'], dct['title']))
 
 
 def is_valid_url(url):
-    attributes = ('scheme', 'netloc')
+    if os.path.splitext(os.path.basename(urlparse(url).path))[1] in EXTENSIONS: return False
+
     parseresult = urllib.parse.urlparse(url)
+    attributes = ('scheme', 'netloc')
     return all(getattr(parseresult, attr) for attr in attributes)
 
 
@@ -135,7 +170,7 @@ def main():
     load_parser.add_argument(
         '--depth', action='store', type=int, help='Level of depth, depth=0..2')
     load_parser.add_argument(
-        '--threads', action='store', type=int, help='Nums of threads')
+        '--workers', action='store', type=int, help='Nums of workers')
     load_parser.set_defaults(func=print_load)
 
     #get
